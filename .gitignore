@@ -1,0 +1,15 @@
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environment & bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# PyCharm & Windows OS files
+.idea/
+Thumbs.db
+Desktop.ini

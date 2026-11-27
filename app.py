@@ -51,6 +51,16 @@ GENRE_OPTIONS = [
     "Western",
 ]
 
+PROVIDER_OPTIONS = [
+    "All Platforms",
+    "Netflix",
+    "Amazon Prime Video",
+    "Disney Plus",
+    "Apple TV Plus",
+    "Max",
+    "Hulu",
+]
+
 CURATOR_SYSTEM_PROMPT = (
     "You are a concise, perceptive film curator. Given a user's preference and a list of "
     "matched movies from our TMDB vector database, write 2-3 sharp sentences per movie explaining "
@@ -70,7 +80,6 @@ def get_clients() -> tuple[OpenAI, Client]:
 @st.cache_data(ttl=300)
 def load_movie_catalog() -> list[dict]:
     _, supabase_client = get_clients()
-    # Select only lightweight metadata for dropdowns—never pull 1536-float vectors into UI memory
     res = (
         supabase_client.table("movies")
         .select("tmdb_id, title, release_year")
@@ -91,6 +100,7 @@ def search_movies_by_vibe(
     min_year: int,
     max_year: int,
     filter_genre: str | None,
+    filter_provider: str | None,
     openai_client: OpenAI,
     supabase_client: Client,
 ) -> list[dict]:
@@ -110,6 +120,7 @@ def search_movies_by_vibe(
             "min_year": min_year,
             "max_year": max_year,
             "filter_genre": filter_genre,
+            "filter_provider": filter_provider,
         },
     ).execute()
 
@@ -160,6 +171,8 @@ def render_movie_cards(movies: list[dict], pitches_by_id: dict[str, str]) -> Non
         sim_pct = round(float(movie["similarity"]) * 100, 1)
         genres_text = ", ".join(movie.get("genres") or [])
         keywords_text = ", ".join((movie.get("keywords") or [])[:6])
+        raw_providers = [p for p in (movie.get("watch_providers") or []) if p != "None"]
+        providers_text = ", ".join(raw_providers) if raw_providers else "Theatrical / VOD"
         curator_note = pitches_by_id.get(str(movie["tmdb_id"]), "").strip()
 
         with st.container(border=True):
@@ -178,8 +191,8 @@ def render_movie_cards(movies: list[dict], pitches_by_id: dict[str, str]) -> Non
                 if movie.get("tagline"):
                     st.markdown(f"*\"{movie['tagline']}\"*")
                 st.caption(
-                    f"Genres: {genres_text} | Director: {movie.get('director', 'N/A')} | "
-                    f"Cast: {movie.get('cast_members', 'N/A')}"
+                    f"Streaming: **{providers_text}** | Genres: {genres_text} | "
+                    f"Director: {movie.get('director', 'N/A')} | Cast: {movie.get('cast_members', 'N/A')}"
                 )
                 if keywords_text:
                     st.caption(f"Themes: {keywords_text}")
@@ -198,18 +211,23 @@ with st.sidebar:
     st.header("Hybrid SQL Filters")
     st.caption("Applied in PostgreSQL before ranking vector similarity.")
 
-    min_rating = st.slider(
-        "Minimum TMDB Rating",
-        min_value=0.0,
-        max_value=9.0,
-        value=6.8,
-        step=0.1,
+    selected_provider = st.selectbox(
+        "Streaming Platform",
+        options=PROVIDER_OPTIONS,
+        index=0,
     )
     year_range = st.slider(
         "Release Year Range",
         min_value=1940,
         max_value=2026,
-        value=(1985, 2026),
+        value=(2000, 2026),
+    )
+    min_rating = st.slider(
+        "Minimum TMDB Rating",
+        min_value=0.0,
+        max_value=9.0,
+        value=6.0,
+        step=0.1,
     )
     selected_genre = st.selectbox("Required Genre", options=GENRE_OPTIONS, index=0)
 
@@ -228,11 +246,19 @@ with st.sidebar:
     st.caption("Movie metadata and posters provided by TMDB.")
 
 active_genre = None if selected_genre == "All Genres" else selected_genre
+active_provider = None if selected_provider == "All Platforms" else selected_provider
 min_year, max_year = year_range
 
-st.title("TMDB pgvector Movie Recommender")
-st.caption(
-    "Semantic plot, keyword, and mood matching powered by TMDB metadata, OpenAI embeddings, and Supabase pgvector."
+st.title("OpenAI + TMDb + Supabase Vector Databases Movie Recommendation")
+st.caption("SEMANTIC RETRIEVAL  •  EMBEDDING PIPELINES  •  HYBRID SQL + VECTOR SEARCH")
+
+st.markdown(
+    "![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white) "
+    "![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white) "
+    "![Supabase](https://img.shields.io/badge/Supabase-3ECF8E?style=for-the-badge&logo=supabase&logoColor=white) "
+    "![pgvector](https://img.shields.io/badge/pgvector-336791?style=for-the-badge&logo=postgresql&logoColor=white) "
+    "![OpenAI API](https://img.shields.io/badge/OpenAI_API-412991?style=for-the-badge&logo=openai&logoColor=white) "
+    "![TMDB API](https://img.shields.io/badge/TMDB_API-01B4E4?style=for-the-badge&logo=themoviedatabase&logoColor=white)"
 )
 
 tab_vibe, tab_similar = st.tabs(
@@ -246,7 +272,7 @@ with tab_vibe:
     vibe_input = st.text_area(
         "Describe the story, mood, or themes you want to watch",
         height=100,
-        placeholder="e.g., A mind-bending sci-fi thriller about memory manipulation, dreams, and high-stakes espionage",
+        placeholder="e.g., A tense survival thriller or cyber-espionage movie with high stakes",
     )
 
     if st.button("Find Matching Movies", type="primary"):
@@ -264,6 +290,7 @@ with tab_vibe:
                         min_year=min_year,
                         max_year=max_year,
                         filter_genre=active_genre,
+                        filter_provider=active_provider,
                         openai_client=openai_client,
                         supabase_client=supabase_client,
                     )
@@ -271,7 +298,7 @@ with tab_vibe:
                     if len(results) == 0:
                         st.info(
                             "No movies matched both your semantic query and sidebar SQL filters. "
-                            "Try lowering Minimum TMDB Rating or Similarity Threshold."
+                            "Try switching Streaming Platform to 'All Platforms' or widening the Year Range."
                         )
                     else:
                         pitches_by_id: dict[str, str] = {}
@@ -337,12 +364,13 @@ with tab_similar:
                             "min_year": min_year,
                             "max_year": max_year,
                             "filter_genre": active_genre,
+                            "filter_provider": active_provider,
                         },
                     ).execute()
                     similar_movies = rpc_res.data or []
 
                     if len(similar_movies) == 0:
-                        st.info("No similar movies matched your current sidebar rating/year/genre filters.")
+                        st.info("No similar movies matched your current sidebar platform/rating/year filters.")
                     else:
                         pitches_by_id: dict[str, str] = {}
                         if include_ai_pitch:

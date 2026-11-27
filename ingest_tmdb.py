@@ -38,12 +38,11 @@ supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 EMBEDDING_MODEL = "text-embedding-3-small"  # 1536 dimensions (matches vector(1536))
-PAGES_TO_FETCH = 15  # 20 movies per page -> up to 300 high-vote films
-BATCH_SIZE = 50      # Fetch, embed, and save every 50 movies as a checkpoint
+BATCH_SIZE = 50
 
 
 # ==============================================================================
-# 2. POOLED TMDB HTTP CLIENT WITH RETRY BACKOFF
+# 2. POOLED TMDB HTTP CLIENT & WATCH PROVIDER PARSER
 # ==============================================================================
 def create_tmdb_session() -> requests.Session:
     session = requests.Session()
@@ -58,7 +57,7 @@ def create_tmdb_session() -> requests.Session:
         total=5,
         connect=5,
         read=5,
-        backoff_factor=1.0,  # Waits 1s, 2s, 4s, 8s, 16s on connection resets or 429/5xx
+        backoff_factor=1.0,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )
@@ -83,58 +82,131 @@ def fetch_tmdb_json(endpoint: str, params: dict | None = None) -> dict:
         raise RuntimeError(f"TMDB request failed for '{endpoint}': {err}") from err
 
 
+def extract_watch_providers(watch_providers_payload: dict, force_netflix: bool = False) -> list[str]:
+    results = watch_providers_payload.get("results", {})
+    providers: list[str] = ["Netflix"] if force_netflix else []
+
+    for region in ("US", "KE"):
+        region_data = results.get(region, {})
+        for item in region_data.get("flatrate", []):
+            raw_name = (item.get("provider_name") or "").strip()
+            if not raw_name:
+                continue
+            normalized = "Netflix" if "netflix" in raw_name.lower() else raw_name
+            if normalized not in providers:
+                providers.append(normalized)
+
+    return providers
+
+
 # ==============================================================================
-# 3. CHECK ALREADY-INDEXED MOVIES IN SUPABASE
+# 3. INSPECT EXISTING MOVIES & BACKFILL STREAMING PROVIDERS ($0 OPENAI COST)
 # ==============================================================================
 try:
-    existing_res = supabase_client.table("movies").select("tmdb_id").execute()
-    existing_ids = {int(row["tmdb_id"]) for row in (existing_res.data or [])}
+    existing_res = supabase_client.table("movies").select("tmdb_id, watch_providers").execute()
+    existing_rows = existing_res.data or []
 except Exception as err:
+    tmdb_session.close()
     raise RuntimeError(f"Failed to query existing movies from Supabase: {err}") from err
+
+existing_ids = {int(row["tmdb_id"]) for row in existing_rows}
+rows_missing_providers = [
+    int(row["tmdb_id"]) for row in existing_rows if not row.get("watch_providers")
+]
 
 print(f"Found {len(existing_ids)} movies already indexed in Supabase.")
 
-# ==============================================================================
-# 4. DISCOVER CANDIDATE MOVIE IDS FROM TMDB
-# ==============================================================================
-candidate_ids = []
-for page in range(1, PAGES_TO_FETCH + 1):
-    discover_data = fetch_tmdb_json(
-        "/discover/movie",
-        params={
-            "language": "en-US",
-            "sort_by": "vote_count.desc",
-            "vote_count.gte": 1500,
-            "include_adult": "false",
-            "page": page,
-        },
-    )
-    for item in discover_data.get("results", []):
-        movie_id = int(item["id"])
-        if movie_id not in existing_ids and movie_id not in candidate_ids:
-            candidate_ids.append(movie_id)
+if len(rows_missing_providers) > 0:
+    print(f"Backfilling streaming providers for {len(rows_missing_providers)} existing movies ($0 OpenAI cost)...")
+    for idx, movie_id in enumerate(rows_missing_providers, start=1):
+        wp_data = fetch_tmdb_json(f"/movie/{movie_id}/watch/providers")
+        providers = extract_watch_providers(wp_data)
+        # Store ["None"] if no flatrate streamer exists so backfill does not repeat on future runs
+        stored_providers = providers if providers else ["None"]
+        supabase_client.table("movies").update({"watch_providers": stored_providers}).eq(
+            "tmdb_id", movie_id
+        ).execute()
+        if idx % 50 == 0:
+            print(f"Updated streaming info for {idx}/{len(rows_missing_providers)} existing movies...")
+        time.sleep(0.05)
 
-if len(candidate_ids) == 0:
-    print("No new movies to ingest. Increase PAGES_TO_FETCH if you want a larger catalog.")
+# ==============================================================================
+# 4. DISCOVER RECENT (2023-2026) & NETFLIX MOVIES FROM TMDB
+# ==============================================================================
+discovery_feeds = [
+    {
+        "label": "Recent Releases (2023-2026)",
+        "pages": 8,
+        "force_netflix": False,
+        "params": {
+            "language": "en-US",
+            "sort_by": "popularity.desc",
+            "primary_release_date.gte": "2023-01-01",
+            "primary_release_date.lte": "2026-12-31",
+            "vote_count.gte": 150,
+            "include_adult": "false",
+        },
+    },
+    {
+        "label": "Netflix Streaming Catalog (Provider ID 8)",
+        "pages": 8,
+        "force_netflix": True,
+        "params": {
+            "language": "en-US",
+            "sort_by": "popularity.desc",
+            "watch_region": "US",
+            "with_watch_providers": "8",
+            "with_watch_monetization_types": "flatrate",
+            "vote_count.gte": 100,
+            "include_adult": "false",
+        },
+    },
+]
+
+candidate_movies: dict[int, bool] = {}  # tmdb_id -> force_netflix flag
+
+for feed in discovery_feeds:
+    print(f"Scanning TMDB feed: {feed['label']}...")
+    for page in range(1, feed["pages"] + 1):
+        query_params = dict(feed["params"])
+        query_params["page"] = page
+        discover_data = fetch_tmdb_json("/discover/movie", params=query_params)
+
+        for item in discover_data.get("results", []):
+            movie_id = int(item["id"])
+            if movie_id in existing_ids:
+                continue
+            if movie_id not in candidate_movies:
+                candidate_movies[movie_id] = feed["force_netflix"]
+            elif feed["force_netflix"]:
+                candidate_movies[movie_id] = True
+
+candidate_list = list(candidate_movies.items())
+
+if len(candidate_list) == 0:
+    print("No new recent or Netflix movies to ingest.")
     tmdb_session.close()
     raise SystemExit(0)
 
-print(f"Discovered {len(candidate_ids)} new movies. Processing in batches of {BATCH_SIZE}...")
+print(f"Discovered {len(candidate_list)} new movies. Processing in batches of {BATCH_SIZE}...")
 
 # ==============================================================================
 # 5. INCREMENTAL CHECKPOINTS: FETCH -> EMBED -> UPSERT EVERY 50 MOVIES
 # ==============================================================================
 total_stored = 0
 
-for batch_start in range(0, len(candidate_ids), BATCH_SIZE):
-    batch_ids = candidate_ids[batch_start : batch_start + BATCH_SIZE]
+for batch_start in range(0, len(candidate_list), BATCH_SIZE):
+    batch_items = candidate_list[batch_start : batch_start + BATCH_SIZE]
     records = []
     texts_to_embed = []
 
-    for movie_id in batch_ids:
+    for movie_id, force_netflix in batch_items:
         details = fetch_tmdb_json(
             f"/movie/{movie_id}",
-            params={"language": "en-US", "append_to_response": "credits,keywords"},
+            params={
+                "language": "en-US",
+                "append_to_response": "credits,keywords,watch/providers",
+            },
         )
 
         overview = (details.get("overview") or "").strip()
@@ -160,6 +232,12 @@ for batch_start in range(0, len(candidate_ids), BATCH_SIZE):
             if kw.get("name")
         ][:12]
 
+        providers = extract_watch_providers(
+            details.get("watch/providers", {}),
+            force_netflix=force_netflix,
+        )
+        stored_providers = providers if providers else ["None"]
+
         crew = details.get("credits", {}).get("crew", [])
         directors = [person["name"] for person in crew if person.get("job") == "Director"]
         director_str = ", ".join(directors) if directors else "Unknown"
@@ -172,6 +250,7 @@ for batch_start in range(0, len(candidate_ids), BATCH_SIZE):
             f"Title: {title} ({release_year or 'N/A'}) | "
             f"Genres: {', '.join(genre_list) if genre_list else 'N/A'} | "
             f"Themes & Keywords: {', '.join(keyword_list) if keyword_list else 'N/A'} | "
+            f"Streaming: {', '.join(providers) if providers else 'Theatrical / VOD'} | "
             f"Director: {director_str} | "
             f"Cast: {cast_str} | "
             f"Tagline: {tagline} | "
@@ -188,6 +267,7 @@ for batch_start in range(0, len(candidate_ids), BATCH_SIZE):
                 "vote_count": vote_count,
                 "genres": genre_list,
                 "keywords": keyword_list,
+                "watch_providers": stored_providers,
                 "director": director_str,
                 "cast_members": cast_str,
                 "tagline": tagline,
@@ -217,10 +297,10 @@ for batch_start in range(0, len(candidate_ids), BATCH_SIZE):
     try:
         supabase_client.table("movies").upsert(records, on_conflict="tmdb_id").execute()
         total_stored += len(records)
-        processed_count = min(batch_start + BATCH_SIZE, len(candidate_ids))
+        processed_count = min(batch_start + BATCH_SIZE, len(candidate_list))
         print(
-            f"Checkpoint saved: {total_stored} movies indexed "
-            f"({processed_count}/{len(candidate_ids)} processed)..."
+            f"Checkpoint saved: {total_stored} new movies indexed "
+            f"({processed_count}/{len(candidate_list)} processed)..."
         )
     except Exception as err:
         tmdb_session.close()
@@ -229,4 +309,4 @@ for batch_start in range(0, len(candidate_ids), BATCH_SIZE):
         ) from err
 
 tmdb_session.close()
-print(f"Done. Successfully indexed {total_stored} new TMDB movies into Supabase.")
+print(f"Done. Indexed {total_stored} recent and Netflix movies into Supabase.")
